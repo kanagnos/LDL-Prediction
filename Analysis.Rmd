@@ -1,0 +1,987 @@
+---
+title: "LDLClassification"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load packages
+```{r libraries}
+rm(list=ls())
+require(tidyverse)
+require(e1071)
+require(caret)
+require(xgboost)
+require(h2o)
+require(ggridges)
+require(gridExtra)
+require(ggpubr)
+require(keras)
+require(kernlab)
+require(janitor)
+require(philentropy)
+require(directlabels)
+require(DiagrammeR)
+require(readxl)
+require(readr)
+```
+
+# Set working dir
+```{r setwd}
+setwd("/Volumes/Macintosh HD - Data/Users/kostas/OneDrive/Docs/protocols/LDLClassification/")
+```
+
+# Definitions
+```{r definitions}
+NCEPlvl <- c("Optimal", "Near optimal", "Borderline high", "High", "Very high")
+ESClvl <- c("LDL Cat 1", "LDL Cat 2", "LDL Cat 3", "LDL Cat 4", "LDL Cat 5", "LDL Cat 6")
+```
+
+
+# Functions
+## Retrieve last value of a vector
+```{r lastvalue}
+lastValue <- function(x) { return( x[length(x)] ) }
+```
+
+## Convert a list from lapply to a dataframe
+```{r fConvert_lapplyListToDataframe}
+fConvert_lapplyListToDataframe <- function(lst) {
+  DF = as.data.frame(do.call(rbind, lst))
+}
+```
+
+## fClassifyLDLByNCEP
+Function to classify LDL by NCEP category
+```{r}
+fClassNCEP <- function(vec) {
+  res <- factor(cut(vec, breaks=c(0, 99, 129, 159, 189, Inf),
+                              labels=c("Optimal", "Near Optimal-Above Optimal",
+                                       "Borderline high", "High", "Very high"),
+                              include.lowest =  T)
+                         )
+  levels(res) = NCEPlvl
+  return(res)  
+}
+```
+
+## fClassifyLDLByESC2019
+Function to classify LDL by ESC 2019 category
+```{r}
+fClassESC <- function(vec) {
+  res <- factor(cut(vec, breaks=c(0, 54, 69, 99, 115, 189, Inf),
+                              labels=c("LDL Cat 1", "LDL Cat 2", "LDL Cat 3",
+                                      "LDL Cat 4", "LDL Cat 5", "LDL Cat 6"),
+                              include.lowest =  T)
+                         )
+  levels(res) = ESClvl
+  return(res)  
+}
+```
+
+
+## fPltRidge
+Function to calculate median values, 2.5 and 97.5 quntiles and plot ggridges for the specified parameter
+```{r fPltRidge}
+fPltRidge <- function(param, pltMarg = c(0.1, -5, 0, 0),
+                      textSize = 18, xAxishjust= 0.35,
+                      hideYaxis = T) {
+    dfTmp <- as.data.frame(
+        rbind(dfKomTrain[,c("src", param)],
+              dfKomTest[,c("src", param)],
+              dfIndep1[,c("src", param)],
+              dfIndep2[,c("src", param)]))
+    
+    # Set order of factor levels
+    dfTmp$src <- factor(dfTmp$src,
+                        levels=c("Independent2", "Independent1", "Test", "Train"))
+    
+    # Calculate median values
+    median_values <- dfTmp %>% 
+        group_by(src) %>%
+        summarise(med=median(!!sym(param)), q2_5=quantile(!!sym(param), probs = 0.025),
+                  q97_5=quantile(!!sym(param),probs = 0.975))
+    # Create the plot
+    if(hideYaxis) {
+      ggplt <-
+          ggplot(dfTmp, aes(x = !!sym(param), y = src, fill=factor(..quantile..))) + 
+          stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=T,
+                              scale=1.2, quantile_lines = T,
+                              quantiles=c(0.025, 0.50, 0.975)) +
+          scale_fill_manual(name="Quartiles", values=c("gray15", "gray30", "gray60", "gray90")) +
+          theme_light() +
+          theme(legend.position = "none",
+                plot.margin=unit(pltMarg, "cm"),
+                axis.text.y=element_blank(),
+                text = element_text(size=textSize),
+                axis.title.x=element_text(hjust=xAxishjust)) +
+          ylab("")
+    } else {
+        ggplt <-
+          ggplot(dfTmp, aes(x = !!sym(param), y = src, fill=factor(..quantile..))) + 
+          stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=T,
+                              scale=1.2, quantile_lines = T,
+                              quantiles=c(0.025, 0.50, 0.975)) +
+          scale_fill_manual(name="Quartiles", values=c("gray15", "gray30", "gray60", "gray90")) +
+          theme_light() +
+          theme(legend.position = "none",
+                plot.margin=unit(pltMarg, "cm"),
+                text = element_text(size=textSize),
+                axis.title.x=element_text(hjust=xAxishjust)) +
+          ylab("Data set")
+      }
+    
+    return(list(plt=ggplt, mdn=median_values))
+}
+```
+
+
+## fPltRidgeIndep
+Calculate median values, 2.5 and 97.5 quntiles and plot ggridges for the specified parameter
+for the Independent data sets 1 and 2 comparing the distributions of the whole data set (Indep1 or Indep2), and the respective Train and Test sets
+```{r fPltRidgeIndep}
+fPltRidgeIndep <- function(param, pltMarg = c(0.1, -5, 0, 0),
+                      indep1or2, textSize = 18, xAxishjust= 0.35,
+                      hideYaxis = T) {
+  if(indep1or2==1) {
+    dfTmp <- as.data.frame(
+          rbind(dfIndep1Train[,c("trainOrTest", param)],
+                dfIndep1Test[,c("trainOrTest", param)]))
+    }  else if(indep1or2==2) {
+      dfTmp <- as.data.frame(
+          rbind(dfIndep2Train[,c("trainOrTest", param)],
+                dfIndep2Test[,c("trainOrTest", param)]))
+  }
+    
+    # Set order of factor levels
+    dfTmp$trainOrTest <- factor(dfTmp$trainOrTest, levels=c("test", "train"))
+    
+    # Calculate median values
+    median_values <- dfTmp %>% 
+        group_by(trainOrTest) %>%
+        summarise(med=median(!!sym(param)), q2_5=quantile(!!sym(param), probs = 0.025),
+                  q97_5=quantile(!!sym(param),probs = 0.975))
+    # Create the plot
+    if(hideYaxis) {
+      ggplt <-
+          ggplot(dfTmp, aes(x = !!sym(param), y = trainOrTest, fill=factor(..quantile..))) + 
+          stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=T,
+                              scale=1.2, quantile_lines = T,
+                              quantiles=c(0.025, 0.50, 0.975)) +
+          scale_fill_manual(name="Quartiles", values=c("gray15", "gray30", "gray60", "gray90")) +
+          theme_light() +
+          theme(legend.position = "none",
+                plot.margin=unit(pltMarg, "cm"),
+                axis.text.y=element_blank(),
+                text = element_text(size=textSize),
+                axis.title.x=element_text(hjust=xAxishjust)) +
+          ylab("")
+    } else {
+        ggplt <-
+          ggplot(dfTmp, aes(x = !!sym(param), y = trainOrTest, fill=factor(..quantile..))) + 
+          stat_density_ridges(geom="density_ridges_gradient", calc_ecdf=T,
+                              scale=1.2, quantile_lines = T,
+                              quantiles=c(0.025, 0.50, 0.975)) +
+          scale_fill_manual(name="Quartiles", values=c("gray15", "gray30", "gray60", "gray90")) +
+          theme_light() +
+          theme(legend.position = "none",
+                plot.margin=unit(pltMarg, "cm"),
+                text = element_text(size=textSize),
+                axis.title.x=element_text(hjust=xAxishjust)) +
+          ylab("Data set")
+      }
+    
+    return(list(plt=ggplt, mdn=median_values))
+}
+```
+
+## fSEE
+Calculate the Standard Error of the Estimate along with the confidence interval.
+```{r}
+fSEE <- function(prediction, measured, lowerCI=0.025, upperCI=0.975) {
+  # Calculate SEE
+  prediction <- as.data.frame(prediction)
+  measured <- as.data.frame(measured)
+  SEE <- sqrt(sum((prediction - measured)^2) / n)
+  # Calculate SEE confidence interval
+  dFreedom <- nrow(prediction)
+  print(dFreedom)
+  lowerCrit <- qchisq(p = lowerCI, df=dFreedom, lower.tail = T)
+  upperCrit <- qchisq(p = upperCI, df=dFreedom, lower.tail = T)
+  lowSEESquared <- (dFreedom * (SEE^2)) / upperCrit
+  upperSEESquared <- (dFreedom * (SEE^2)) / lowerCrit
+  lowSEE <- sqrt(lowSEESquared)
+  upperSEE <- sqrt(upperSEESquared)
+  
+  return(list(SEE=SEE, lowerSSE=lowSEE, upperSEE=upperSEE))
+}
+```
+
+## fAccur
+Use the caret::confusionmatrix function to calculate the Accuracy and its 95% CI
+```{r}
+fAccur <- function(vecExper, vecPred, roundDigits = 2) {
+  CF <- caret::confusionMatrix(vecExper, vecPred)
+  accur <- round(c(CF$overall["Accuracy"], CF$overall["AccuracyLower"],
+             CF$overall["AccuracyUpper"]), roundDigits)
+  return(accur)
+}
+```
+
+
+## fDNNRegrGridSearch
+Function to include in a loop to search for the best DNN architecture for regression prediction of LDL values from CHOL, HDL and TG.
+```{r fDNNRegrGridSearch}
+fDNNRegrGridSearch <- function(DF=dfKomTrain, noOfFolds=5, lstFolds=komTrainFolds,
+                               hiddenLayers=rep(30, 6), activation="Rectifier",
+                               noOfEpochs=100, samplesPerIter = -2) {
+    cnt <- 1
+    vecMSE <- vector(mode="numeric", length=kFolds)
+
+    for(i in 1:noOfFolds) {
+        x <- lstFolds[[i]]
+        trainFold <- DF[-x, ]
+        testFold <- DF[x, ]
+        LDL_dnn = h2o.deeplearning(y="LDLd",
+                                   training_frame =
+                                     as.h2o(trainFold[ ,c("CHOLScaled","HDLScaled",
+                                                          "TGScaled", "LDLd")]),
+                                   activation = activation,
+                                   hidden = hiddenLayers,
+                                   epochs = noOfEpochs,
+                                   train_samples_per_iteration = samplesPerIter)
+        LDL_dnn_Pred <- h2o.predict(LDL_dnn, newdata =
+                                      as.h2o(testFold[,c("CHOLScaled", "HDLScaled",
+                                                         "TGScaled")]))
+        LDL_dnn_Pred <- as.vector(LDL_dnn_Pred)
+        mse <- sum((LDL_dnn_Pred - testFold$LDLd)^2) / nrow(testFold)
+        vecMSE[cnt] <- mse
+        cnt <- cnt + 1
+    }
+  return(min(vecMSE))    
+}
+```
+
+##fJSD
+Calculate Jensen-Shannon divergence between the same parameter of different data sets. This works only for two distributions. As arguments we give the two data frames and the parameter (CHOL, HDL or TG)
+```{r}
+fJSD <- function(DF1=dfKomTrain, DF2=dfKomTest, param="CHOL") {
+  vec1 <- DF1[, param]; vec2 <- DF2[, param]
+  #Calculate the frequencies of vec1
+  df1Freqs <- as.data.frame(janitor::tabyl(vec1))
+  #The tabyl command gives a data frame with not only the frequencies but also the
+  #percentages. Remove this column
+  df1Freqs$percent <- NULL
+  #Change column names
+  colnames(df1Freqs) <- c("Param", "vec1Freq")
+  #The same as above for vec2
+  df2Freqs <- as.data.frame(janitor::tabyl(vec2))
+  df2Freqs$percent <- NULL
+  colnames(df2Freqs) <- c("Param", "vec2Freq")
+  
+  #Merge the two frequency data frames by the "Param" column.
+  #When a Param value does not exist in one of the data frames, an NA is
+  #inserted
+  dfFreqs <- merge(df1Freqs, df2Freqs, by="Param", all.x=T, all.y = T)
+  colnames(dfFreqs) <- c("Param", "vec1", "vec2")
+  dfFreqs[is.na(dfFreqs)] <- 0 #Replace NA with zeros.
+  
+  #Calc the probabilities of vec1 and vec2 frequencies. They should sum to 1.
+  dfFreqs$vec1Prob <- dfFreqs$vec1 / sum(dfFreqs$vec1)
+  vec1ProbSum <- sum(dfFreqs$vec1Prob)
+  dfFreqs$vec2Prob <- dfFreqs$vec2 / sum(dfFreqs$vec2)
+  vec2ProbSum <- sum(dfFreqs$vec2Prob)
+  
+  JSDres <- philentropy::JSD(rbind(dfFreqs$vec1Prob, dfFreqs$vec2Prob))
+  return(list(JSD=JSDres, freq1=df1Freqs, freq2=df2Freqs,
+              freqs=dfFreqs, vec1PSum=vec1ProbSum, vec2PSum=vec2ProbSum))
+}
+```
+
+# Load
+## Training, test, Independent 1 and 2 data sets. Also independent 1 and 2 split train and test data sets
+```{r load data sets}
+dfKomTrain <- read.csv("dfKomTrain.csv", header=T, sep=",")
+dfKomTrain[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfKomTrain[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfKomTrain[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfKomTrain[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+dfKomTest  <- read.csv("dfKomTest.csv",  header=T, sep=",")
+dfKomTest[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfKomTest[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfKomTest[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfKomTest[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+dfIndep1 <- read.csv("dfIndep1.csv", header=T, sep=",")
+dfIndep1[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfIndep1[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfIndep1[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfIndep1[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+dfIndep2 <- read.csv("dfIndep2.csv",     header=T, sep=",")
+dfIndep2[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfIndep2[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfIndep2[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfIndep2[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+dfIndep1Train <- read.csv("dfIndep1Train.csv", header=T, sep=",")
+dfIndep1Train[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfIndep1Train[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfIndep1Train[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfIndep1Train[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+
+dfIndep1Test <- read.csv("dfIndep1Test.csv", header=T, sep=",")
+dfIndep1Test[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfIndep1Test[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfIndep1Test[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfIndep1Test[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+dfIndep2Train <- read.csv("dfIndep2Train.csv", header=T, sep=",")
+dfIndep2Train[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfIndep2Train[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfIndep2Train[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfIndep2Train[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+
+dfIndep2Test <- read.csv("dfIndep2Test.csv", header=T, sep=",")
+dfIndep2Test[,c("NCEPd", "NCEPf", "NCEPn")] <-
+    lapply(dfIndep2Test[,c("NCEPd", "NCEPf", "NCEPn")], factor, levels=NCEPlvl)
+dfIndep2Test[,c("ESCd", "ESCf", "ESCn")] <-
+    lapply(dfIndep2Test[,c("ESCd", "ESCf", "ESCn")], factor, levels=ESClvl)
+```
+
+## k-cross validations sets
+```{r k-cross val sets}
+komTrainFolds <- readRDS(file="komTrainFolds.rds")
+```
+
+# ------------------------
+# 1.Density ridges and medians
+
+# Add a column in all 4 whole data sets describing the data source (Train, Test, Indep1, Indep2)
+```{r addDataSourceCol}
+dfKomTrain$src <- "Train"
+dfKomTest$src <- "Test"
+dfIndep1$src <- "Independent1"
+dfIndep2$src <- "Independent2"
+```
+
+# Add a column to dfIndep1 Train and Test and dfIndep2 Train and Test to signify if it is training or test
+```{r addTrainTestCol}
+dfIndep1Train$trainOrTest <- "train"
+dfIndep1Test$trainOrTest <- "test"
+dfIndep2Train$trainOrTest <- "train"
+dfIndep2Test$trainOrTest <- "test"
+```
+
+## ...Figure S1...
+### For whole data sets
+```{r FigS1}
+CHOLmedian <- fPltRidge(param="CHOL", hideYaxis = F)$mdn
+HDLmedian <- fPltRidge(param="HDL", pltMarg = c(0.1, -7, 0, 0))$mdn
+TGmedian <- fPltRidge(param="TG", pltMarg = c(0.1, -14, 0, 0) )$mdn
+LDLdMedian <- fPltRidge(param="LDLd", pltMarg = c(0.1, -1, 0, 0))$mdn
+
+ggpltCHOL <- fPltRidge(param="CHOL", hideYaxis = F)$plt
+ggpltHDL <- fPltRidge(param="HDL", pltMarg = c(0.1, -7, 0, 0))$plt
+ggpltTG <- fPltRidge(param="TG", pltMarg = c(0.1, -14, 0, 0) )$plt
+ggpltLDLd <- fPltRidge(param="LDLd", pltMarg = c(0.1, -1, 0, 0))$plt
+
+figureS1 <- 
+  grid.arrange(ggpltCHOL, ggpltHDL, ggpltTG, ggpltLDLd, ncol=4)
+
+rm(CHOLmedian, HDLmedian, TGmedian, LDLdMedian)
+rm(ggpltCHOL, ggpltHDL, ggpltTG, ggpltLDLd)
+rm(figureS1)
+```
+
+## ...Figure S2...
+### Independent data set 1 split into training and test
+```{r FigS2}
+ggpltCHOLIndep1 <- fPltRidgeIndep(param = "CHOL", indep1or2 = 1, hideYaxis = F,
+                                  pltMarg = c(0.1, 0, 0, 0))$plt
+ggpltHDLIndep1 <- fPltRidgeIndep(param = "HDL", indep1or2 = 1, hideYaxis = T,
+                                 pltMarg = c(0.1, 0, 0, 0))$plt
+ggpltTGIndep1 <- fPltRidgeIndep(param = "TG", indep1or2 = 1, hideYaxis = T,
+                                pltMarg = c(0.1, 0, 0, 0))$plt
+ggpltLDLdIndep1 <- fPltRidgeIndep(param = "LDLd", indep1or2 = 1, hideYaxis = T,
+                                  pltMarg = c(0.1, 0, 0, 0))$plt
+figureS2 <- grid.arrange(ggpltCHOLIndep1, ggpltHDLIndep1, ggpltTGIndep1,
+                         ggpltLDLdIndep1, ncol=4)
+rm(ggpltCHOLIndep1, ggpltHDLIndep1, ggpltTGIndep1, ggpltLDLdIndep1)
+rm(figureS2)
+```
+
+## ...Figure S3...
+####Z Independent data set 2 split into training and test
+```{r FigS3}
+ggpltCHOLIndep2 <- fPltRidgeIndep(param = "CHOL", indep1or2 = 2, hideYaxis = F,
+                                  pltMarg = c(0.1, 0, 0, 0))$plt
+ggpltHDLIndep2 <- fPltRidgeIndep(param = "HDL", indep1or2 = 2, hideYaxis = T,
+                                 pltMarg = c(0.1, 0, 0, 0))$plt
+ggpltTGIndep2 <- fPltRidgeIndep(param = "TG", indep1or2 = 2, hideYaxis = T,
+                                pltMarg = c(0.1, 0, 0, 0))$plt
+ggpltLDLdIndep2 <- fPltRidgeIndep(param = "LDLd", indep1or2 = 2, hideYaxis = T,
+                                  pltMarg = c(0.1, 0, 0, 0))$plt
+figureS3 <- grid.arrange(ggpltCHOLIndep2, ggpltHDLIndep2, ggpltTGIndep2,
+                         ggpltLDLdIndep2, ncol=4)
+rm(ggpltCHOLIndep2, ggpltHDLIndep2, ggpltTGIndep2, ggpltLDLdIndep2)
+rm(figureS3)
+```
+
+## Remove source columns
+```{r removeSourceCols}
+dfKomTest$src <- dfKomTrain$src <- dfIndep1$src <- dfIndep2$src <- NULL
+dfIndep1Test$trainOrTest <- dfIndep1Train$trainOrTest <-
+  dfIndep2Train$trainOrTest <- dfIndep2Test$trainOrTest <- NULL
+```
+
+# ------------------------
+# 2.JS divergence
+## Calc JSD for the pairs of data sets given in dataSet1 and dataSet2 and for the 3 parameters (CHOL, HDL, TG)
+```{r, message=F}
+dataSet1 <- c("dfKomTrain", "dfKomTrain", "dfKomTrain",
+              "dfIndep1", "dfIndep2", "dfIndep1")
+dataSet2 <- c("dfKomTest", "dfIndep1", "dfIndep2",
+              "dfIndep1Test", "dfIndep2Test", "dfIndep2")
+params <- c("CHOL", "HDL", "TG")
+
+dfJSD <- data.frame(dataSet1=character(5), dataSet2=character(5),
+                    CHOL=numeric(5), HDL=numeric(5), TG=numeric(5))
+for(datasetIdx in 1:length(dataSet1))   {
+    for(paramIdx in 1:length(params)) {
+        df1 <- dataSet1[[datasetIdx]]
+        df2 <- dataSet2[[datasetIdx]]
+        param <- params[paramIdx]
+        JSDval <- fJSD(DF1=get(df1), DF2=get(df2), param)$JSD
+        dfJSD[datasetIdx, c("dataSet1", "dataSet2")] <- c(df1, df2)
+        dfJSD[datasetIdx, param] <- round(JSDval, 2)
+    }
+}
+dfJSD$JSDMulti <- dfJSD$CHOL + dfJSD$HDL + dfJSD$TG
+rm(dataset1, dataset2, params, dfJSD)
+```
+
+# ------------------------
+# 3. LDLf
+## Estimation SEE
+```{r LDLf_SEE}
+LDLfTestSEE <-
+  round(unlist(fSEE(dfKomTest$LDLf, dfKomTest$LDLd)), 1)# SEE for test data set
+cor.test(dfKomTest$LDLf, dfKomTest$LDLd)# Corr coef for test data set
+LDLfTestSEE <- formatC(LDLfTestSEE, digits=2, format="f")
+
+LDLfIndep1SEE <-
+  round(unlist(fSEE(dfIndep1$LDLf, dfIndep1$LDLd)), 1)
+cor.test(dfIndep1$LDLf, dfIndep1$LDLd)# Corr coef for indep1 data set
+LDLfIndep1SEE <- formatC(LDLfIndep1SEE, digits=2, format="f")
+cor.test(dfIndep2$LDLf, dfIndep2$LDLd)# Corr coef for indep1 data set
+
+LDLfIndep2SEE <-
+  round(unlist(fSEE(dfIndep2$LDLf, dfIndep2$LDLd)), 1)
+LDLfIndep2SEE <- formatC(LDLfIndep2SEE, digits=2, format="f")
+```
+
+# ------------------------
+# 4. LDLn
+## Estimation SEE
+```{r}
+LDLnTestSEE <-
+  round(unlist(fSEE(dfKomTest$LDLn, dfKomTest$LDLd)), 1)# SEE for test data set
+
+LDLnIndep1SEE <-
+  round(unlist(fSEE(dfIndep1$LDLn, dfIndep1$LDLd)), 1)
+
+LDLnIndep2SEE <-
+  round(unlist(fSEE(dfIndep2$LDLn, dfIndep2$LDLd)), 1)
+```
+
+## Remove temp variables
+```{r}
+rm(list=ls(pattern="test*"))
+rm(list=ls(pattern="indep*"))
+rm(list=ls(pattern="vecLDLfNCEP"))
+rm(list=ls(pattern="vecLDLfESC"))
+```
+
+## Clean up
+```{r}
+rm(list=ls(pattern="vec*"))
+rm(list=ls(pattern="LDLf*"))
+```
+
+# ------------------------------------------
+# 5 Multivariate linear regression (LR) for LDL
+## Train on main train data set
+```{r}
+LR_TrainRegr <- lm(LDLd ~ CHOL + HDL + TG, data=dfKomTrain)
+summary(LR_TrainRegr)
+```
+## Predict test data using the training on the train data set
+```{r}
+LR_TrainTestRegrPred <- predict(LR_TrainRegr, newdata = dfKomTest, se=T)$fit
+LR_TrainTestSEE <- round(unlist(fSEE(LR_TrainTestRegrPred, dfKomTest$LDLd)), 1)
+```
+
+#### Predict indep1 using train data set
+```{r}
+LR_TrainIndep1RegrPred <- predict(LR_TrainRegr, newdata = dfIndep1, se = T)$fit
+LR_TrainIndep1SEE <- round(unlist(
+  fSEE(LR_TrainIndep1RegrPred, dfIndep1$LDLd)), 2)
+```
+
+#### Predict indep2 
+```{r}
+LR_TrainIndep2RegrPred <- predict(LR_TrainRegr, newdata = dfIndep2)
+LR_TrainIndep2SEE <- round(unlist(
+  fSEE(LR_TrainIndep2RegrPred, dfIndep2$LDLd)), 2)
+```
+
+### Tune on independent data sets
+##### Tune on Indep1 test data set
+```{r}
+LR_Indep1RegrTrain <- lm(LDLd ~ CHOL + HDL + TG, data=dfIndep1Test)
+summary(LR_Indep1RegrTrain)
+```
+
+#### Predict indep1 test
+```{r}
+LR_Indep1testRegrPred <- predict(LR_Indep1RegrTrain,
+                                    newdata = dfIndep1Test)
+LR_Indep1testSEE <- round(unlist(fSEE(LR_Indep1testRegrPred,
+                                      dfIndep1Test$LDLd)), 1)
+LR_Indep1testSEE
+```
+
+### Tune on Indep2 test data set
+```{r}
+LR_Indep2RegrTrain <- lm(LDLd ~ CHOL + HDL + TG, data=dfIndep2Test)
+summary(LR_Indep2RegrTrain)
+```
+
+#### Predict indep2 test
+```{r}
+LR_Indep2testRegrPred <- predict(LR_Indep2RegrTrain,
+                                    newdata = dfIndep2Test)
+LR_Indep2testSEE <- round(unlist(fSEE(LR_Indep2testRegrPred,
+                                      dfIndep2Test$LDLd)), 1)
+LR_Indep2testRegrSEE
+```
+
+# -----------------------
+# 6. Radial Basis Kernel SVM
+## Regression
+### Tune on Train sata set
+The code chunk will not be run, but the model will be loaded from file in the next chunk.
+```{r, eval=F}
+radSVM_TrainRegr <- caret::train(form = LDLd ~ CHOLScaled + TGScaled +
+                                   HDLScaled,
+                                   data = dfKomTrain,
+                                   method = "svmRadial")
+```
+
+### Read radSVM_TrainRegr from file
+```{r}
+radSVM_TrainRegr <- readRDS(file="./radSVM_TrainRegr.rds")
+radSVM_TrainRegr
+ggplot(radSVM_TrainRegr)
+```
+
+#### Predict test data using the training on the train data set
+```{r}
+radSVMTestRegrPred <- predict(radSVM_TrainRegr, newdata = dfKomTest, se=T)
+radSVMTestSEE <- round(unlist(
+  fSEE(radSVMTestRegrPred, dfKomTest$LDLd)), 1)
+radSVMTestSEE
+```
+
+#### Predict indep1 using train data set
+```{r}
+radSVMIndep1RegrPred <- predict(radSVM_TrainRegr, newdata = dfIndep1, se = T)
+radSVMIndep1SEE <- round(unlist(
+  fSEE(radSVMIndep1RegrPred, dfIndep1$LDLd)), 1)
+radSVMIndep1SEE
+```
+
+#### Predict indep2 
+```{r}
+radSVMIndep2RegrPred <- predict(radSVM_TrainRegr, newdata = dfIndep2)
+radSVMIndep2SEE <- round(unlist(
+  fSEE(radSVMIndep2RegrPred, dfIndep2$LDLd)), 1)
+radSVMIndep2SEE
+```
+
+### Tune on independent data sets
+##### Tune on Indep1 test data set
+```{r}
+radSVMIndep1RegrTrain <- caret::train(form = LDLd ~
+                                        CHOLScaled + TGScaled + HDLScaled,
+                                   data = dfIndep1Train,
+                                   method = "svmRadial")
+radSVMIndep1RegrTrain
+```
+
+#### Predict indep1 test
+```{r}
+radSVMIndep1testRegrPred <- predict(radSVMIndep1RegrTrain,
+                                    newdata = dfIndep1Test)
+radSVMIndep1testSEE <- round(unlist(fSEE(radSVMIndep1testRegrPred,
+                                      dfIndep1Test$LDLd)), 1)
+radSVMIndep1testSEE
+```
+
+### Tune on Indep2 test data set
+```{r}
+radSVMIndep2RegrTrain <- caret::train(form = LDLd ~
+                                        CHOLScaled + TGScaled + HDLScaled,
+                                   data = dfIndep2Train,
+                                   method = "svmRadial")
+radSVMIndep2RegrTrain
+```
+
+#### Predict indep2 test
+```{r}
+radSVMIndep2testRegrPred <- predict(radSVMIndep2RegrTrain,
+                                    newdata = dfIndep2Test)
+radSVMIndep2testRegrSEE <- round(unlist(fSEE(radSVMIndep2testRegrPred,
+                                      dfIndep2Test$LDLd)), 1)
+radSVMIndep2testRegrSEE
+```
+
+### Clean up
+```{r}
+rm(list=ls(pattern = "radSVM*"))
+rm(list=ls(pattern = "vecRadSVM*"))
+```
+
+# -----------------------
+# 7. DART XGBoost
+## Regression
+### Tune on Train data set
+```{r, eval=F}
+drtXGB_TrainRegr <- caret::train(form = LDLd ~ CHOL + TG + HDL,
+                                   data = dfKomTrain,
+                                   method = "xgbDART")
+```
+
+### Load drtXGB_TrainRegr
+```{r}
+drtXGB_TrainRegr <- readRDS(file="./drtXGB_Train.rds")
+drtXGB_TrainRegr
+```
+
+### Plot trees
+```{r}
+xgb.plot.tree(model=drtXGB_TrainRegr$finalModel, trees=4)
+```
+
+#### Predict test data using Train
+```{r}
+drtXGBTestRegrPred <- predict(drtXGB_TrainRegr, newdata = dfKomTest)
+drtXGBTestSEE <- round(unlist(fSEE(drtXGBTestRegrPred, dfKomTest$LDLd)), 1)
+drtXGBTestSEE
+```
+
+#### Predict indep1 using Train
+```{r}
+drtXGBIndep1RegrPred <- predict(drtXGB_TrainRegr, newdata = dfIndep1)
+drtXGBIndep1SEE <- round(unlist(fSEE(drtXGBIndep1RegrPred, dfIndep1$LDLd)),1)
+drtXGBIndep1SEE
+```
+
+#### Predict indep2 using Train
+```{r}
+drtXGBIndep2RegrPred <- predict(drtXGB_TrainRegr, newdata = dfIndep2)
+drtXGBIndep2SEE <- round(unlist(fSEE(drtXGBIndep2RegrPred, dfIndep2$LDLd)),1)
+drtXGBIndep2SEE
+```
+
+### Tune on independent data sets
+##### Tune on Indep1 test data set
+```{r, eval=F}
+drtXGBIndep1TrainRegr <- caret::train(form = LDLd ~ CHOL + TG + HDL,
+                                   data = dfIndep1Train,
+                                   method = "xgbDART")
+```
+
+#### Load drtXGBIndep1TrainRegr
+```{r}
+drtXGBIndep1TrainRegr <-
+  readRDS(file="./drtXGBIndep1TrainRegr.rds")
+```
+
+##### Predict indep1 test
+```{r}
+drtXGBIndep1TestRegrPred <- predict(drtXGBIndep1TrainRegr,
+                                     newdata = dfIndep1Test)
+drtXGB_Indep1TestSEE <- round(unlist(
+  fSEE(drtXGBIndep1TestRegrPred, dfIndep1Test$LDLd)),1)
+drtXGB_Indep1TestSEE
+```
+
+### Tune on Indep2 test data set
+```{r, eval=F}
+drtXGB_Indep2TrainRegr <- caret::train(form = LDLd ~ CHOL + TG + HDL,
+                                   data = dfIndep2Train,
+                                  method = "xgbDART")
+```
+
+### Load drtXGB_Indep2TrainRegr
+```{r}
+drtXGB_Indep2TrainRegr <-
+  readRDS(file="./drtXGB_Indep2TrainRegr.rds")
+```
+
+#### Predict indep2 test
+```{r}
+drtXGBIndep2TestRegrPred <- predict(drtXGB_Indep2TrainRegr,
+                                    newdata = dfIndep2Test)
+drtXGBIndep2TestSEE <- round(unlist(
+  fSEE(drtXGBIndep2TestRegrPred, dfIndep2Test$LDLd)),1)
+drtXGBIndep2TestSEE
+```
+
+### Clean-up
+```{r}
+rm(list=ls(pattern="drtXGB*"))
+rm(list=ls(pattern="vecdrtXGB*"))
+```
+
+# -----------------------
+# 8. Neural network
+##Regression
+### Search for the network architecture that minimizes the MSE using 5-fold cross-validation
+```{r, eval=F}
+h2o.init(nthreads=-1)
+h2o.no_progress()
+vecNLayer <- seq(1,20)
+vecNNodes <- seq(1,60)
+size <- length(vecNLayer) * length(vecNNodes)
+dfLDLdnn <- data.frame(nLayers=integer(size), nNodes=integer(size), MSE=numeric(size))
+cnt <- 0
+pb <- txtProgressBar(min = 0, max = size, style = 3, char="#")
+   for(nLayer in 1:20) {
+      for(nNode in 1:60) {
+       cnt <- cnt + 1
+       setTxtProgressBar(pb, cnt)
+        vecHidden <- rep(vecNNodes[[nNode]], vecNLayer[[nLayer]])
+        dfLDLdnn[cnt, 1:2] <- c(vecNLayer[[nLayer]], vecNNodes[[nNode]])
+        tryCatch({
+            dnnRes <- fDNNRegrGridSearch(DF=dfKomTrain, noOfFolds = 5,
+                                         lstFolds = komTrainFolds,
+                                         activation = "Rectifier",
+                                         hiddenLayers = vecHidden)},
+            error=function(e){})
+        dfLDLdnn[cnt, 3] <- dnnRes
+        cat(vecHidden, dnnRes, "\n")
+      }
+  }
+h2o.shutdown(prompt = F)
+```
+
+```{r}
+dfDnnRegr <- read.csv(file="./dfDnnRegr.csv", header=T, sep=",")
+optimalDNN <- dfDnnRegr[which.min(dfDnnRegr$MSE), ]
+```
+
+The architecture of the DNN for which the mean squared error is min is 1 layers of 21 nodes.
+In a previous iteration it was 3 layers of 29 nodes.
+
+### Train the neural net with the above architecture (1 layer of 21 nodes) and predict the test data set. Then calculate the SEE.
+```{r}
+h2o.init(nthreads=-1)
+dnnTrainRegr = h2o.deeplearning(y="LDLd",
+                           training_frame =
+                             as.h2o(dfKomTrain[ ,c("CHOLScaled", "HDLScaled",
+                                                   "TGScaled", "LDLd")]),
+                           activation = "Rectifier",
+                           hidden = rep(21, 1), #c(nodes, layers)
+                           epochs = 100,
+                           train_samples_per_iteration = -2)
+```
+
+### Predict test data using train
+```{r}
+dnnTestRegrPred <-
+  h2o.predict(dnnTrainRegr,
+              newdata = as.h2o(dfKomTest[,c("CHOLScaled", "HDLScaled",
+                                            "TGScaled")]))
+dnnTestRegrPredSEE <- round(unlist(fSEE(dnnTestRegrPred, dfKomTest$LDLd)),1)
+dnnTestRegrPredSEE
+```
+
+### Predict indep 1
+```{r}
+dnnIndep1RegrPred <-
+  h2o.predict(dnnTrainRegr,
+              newdata =as.h2o(dfIndep1[,c("CHOLScaled", "HDLScaled",
+                                          "TGScaled")]))
+dnnIndep1RegrPredSEE <- round(unlist(fSEE(dnnIndep1RegrPred, dfIndep1$LDLd)),1)
+dnnIndep1RegrPredSEE
+```
+
+### Predict indep 2
+```{r}
+dnnIndep2RegrPred <- h2o.predict(dnnTrainRegr, newdata =
+                                 as.h2o(dfIndep2[,c("CHOLScaled", "HDLScaled",
+                                                    "TGScaled")]))
+dnnIndep2RegrPredSEE <- round(unlist(fSEE(dnnIndep2RegrPred, dfIndep2$LDLd)),1)
+dnnIndep2RegrPredSEE
+```
+
+### Clean up
+```{r}
+rm(list=ls(pattern="dnn*"))
+rm(list=ls(pattern="vecDnn*"))
+```
+
+# ----------------------------------------
+# 9. SEE versus JSD graph
+```{r}
+dfJSD_SEE <- read_excel("SEEvsJSD.xlsx")
+str(dfJSD_SEE)
+dfJSD_SEE_long <- dfJSD_SEE %>% 
+  pivot_longer(cols=-c("TrainSet", "TestSet", "JSD"),
+               values_to="SEE") %>% 
+  drop_na() %>% 
+  arrange(JSD)
+  
+ggplot(data=dfJSD_SEE_long, aes(x=JSD, y=SEE)) +
+  geom_line(aes(linetype=name), size=1) +
+  geom_point(aes(shape=name), size=2) +
+  xlab("Jensen-Shannon Divergence") +
+  ylab("Standard Error of the Estimate") +
+  geom_dl(aes(label = name),method =
+                list(dl.combine("last.points"),
+                  dl.trans(x=x-1, y=y)), cex = 0.8) +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=14),
+          axis.title.y = element_text(size=14),
+          axis.text = element_text(size=14))
+
+
+ggplot(data=dfJSD_SEE_long, aes(x=JSD, y=SEE)) +
+  geom_line(aes(linetype=name), size=1) +
+  geom_point(aes(shape=name), size=2) +
+  xlab("Jensen-Shannon Divergence") +
+  ylab("Standard Error of the Estimate") +
+  geom_dl(aes(label = name),method =
+                list("last.bumpup", cex = 1.3, hjust = 1, vjust=1,
+                  dl.trans(x=x, y=y)), cex = 0.8) +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=14),
+          axis.title.y = element_text(size=14),
+          axis.text = element_text(size=14))
+
+
+```
+
+#-----------------------------------
+#10. SEE graphs
+## Read file
+```{r}
+dfSEE <- read_excel("SEEgraphData.xlsx")
+str(dfSEE)
+
+# Function to add a line break in the x axis labels
+addline_format <- function(x,...){
+    gsub('\\s','\n',x)
+}
+```
+
+## Plot LDLf and LDLn SEE for the Test, Indep1 and Indep2
+```{r}
+dfSEE <- read_excel("SEEgraphData.xlsx")
+dfSEE <- dfSEE %>% filter(TrainSet=="-")
+dfSEE$method <- factor(dfSEE$method,
+  levels=c("LDLf - Test", "LDLn - Test",
+           "LDLf - Indep1", "LDLn - Indep1",
+           "LDLf - Indep2", "LDLn - Indep2"))
+str(dfSEE)
+
+pltLDLfn <- 
+  ggplot(dfSEE, aes(x=method, y=SEE)) +
+      geom_point(shape=21, size=3, fill="white") +
+      geom_errorbar(width=.05, aes(ymin=lowSEE, ymax=upSEE)) +
+      geom_text(aes(label=SEE), hjust=dfSEE$SEEhjust,
+                vjust=dfSEE$SEEvjust, size=4) +
+      geom_text(aes(label=lowSEElbl, y=lowSEE),
+                hjust=dfSEE$lowSEEhjust, vjust=dfSEE$lowSEEvjust, size=4) +
+      geom_text(aes(label=upSEElbl, y=upSEE),
+                hjust=dfSEE$upSEEhjust, vjust=dfSEE$upSEEvjust, size=4) +
+      scale_x_discrete(breaks=unique(dfSEE$method),
+                       labels=addline_format(dfSEE$method)) +
+      xlab(label=("method\nTrain Set\nTest Set")) +
+      geom_vline(xintercept = c(2.5, 4.5), linetype = 2)
+pltLDLfn
+```
+
+## Plot SEE for the Train set using Test Indep1 and Indep2as Test sets
+```{r}
+dfSEE <- read_excel("SEEgraphData.xlsx")
+dfSEE <- dfSEE %>% filter(TrainSet=="Train") 
+lvl <- c("LR Train Test","SVM Train Test","XGB Train Test","DNN Train Test",
+       "LR Train Indep1","SVM Train Indep1","XGB Train Indep1","DNN Train Indep1",
+       "LR Train Indep2","SVM Train Indep2","XGB Train Indep2","DNN Train Indep2")
+dfSEE$method <- factor(dfSEE$method, levels=lvl)
+
+pltTrain <- 
+  ggplot(dfSEE, aes(x=method, y=SEE)) +
+      #geom_line() +
+      geom_point(shape=21, size=2, fill="white") +
+      geom_errorbar(width=.05, aes(ymin=lowSEE, ymax=upSEE)) +
+      geom_text(aes(label=SEE), hjust=dfSEE$SEEhjust,
+                vjust=dfSEE$SEEvjust, size=4) +
+      geom_text(aes(label=lowSEElbl, y=lowSEE),
+                hjust=dfSEE$lowSEEhjust, vjust=dfSEE$lowSEEvjust, size=4) +
+      geom_text(aes(label=upSEElbl, y=upSEE),
+                hjust=dfSEE$upSEEhjust, vjust=dfSEE$upSEEvjust, size=4) +                  scale_x_discrete(breaks=unique(dfSEE$method),
+                       labels=addline_format(dfSEE$method)) +
+      xlab(label=("method\nTrain Set\nTest Set")) +
+      geom_vline(xintercept = c(4.5, 8.5), linetype = 2)
+pltTrain
+```
+
+## Plot SEE for the Indep Train sets using Indep Test sets Test sets
+```{r}
+dfSEE <- read_excel("SEEgraphData.xlsx")
+dfSEE <- dfSEE %>% filter(TrainSet %in% c("Indep1-Train", "Indep2-Train")) 
+lvl <- c("LR Indep1-Train Indep1-Test", "SVM Indep1-Train Indep1-Test",
+         "XGB Indep1-Train Indep1-Test",
+         "LR Indep2-Train Indep2-Test", "SVM Indep2-Train Indep2-Test",
+         "XGB Indep2-Train Indep2-Test")
+dfSEE$method <- factor(dfSEE$method, levels=lvl)
+
+pltIndep <- 
+  ggplot(dfSEE, aes(x=method, y=SEE)) +
+      #geom_line() +
+      geom_point(shape=21, size=2, fill="white") +
+      geom_errorbar(width=.05, aes(ymin=lowSEE, ymax=upSEE)) +
+      geom_text(aes(label=SEE), hjust=dfSEE$SEEhjust,
+                vjust=dfSEE$SEEvjust, size=4) +
+      geom_text(aes(label=lowSEElbl, y=lowSEE),
+                hjust=dfSEE$lowSEEhjust, vjust=dfSEE$lowSEEvjust, size=4) +
+      geom_text(aes(label=upSEElbl, y=upSEE),
+                hjust=dfSEE$upSEEhjust, vjust=dfSEE$upSEEvjust, size=4) +                  scale_x_discrete(breaks=unique(dfSEE$method),
+                       labels=addline_format(dfSEE$method)) +
+      xlab(label=("method\nTrain Set\nTest Set")) +
+      geom_vline(xintercept = c(3.5), linetype = 2)
+pltIndep
+```
+
+## Arrange plots
+```{r}
+ggarrange(
+  pltTrain, # First row with Train plot
+  # Second row with LDLfn and Indep plots
+  ggarrange(pltLDLfn, pltIndep, ncol = 2, labels = c("B", "C")), nrow = 2, 
+  labels = "A")       # Label of the Train plot
+```
+
